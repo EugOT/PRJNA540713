@@ -1,0 +1,569 @@
+---
+title:"Exploratory analysis and Quality Control of Lateral hypothalamic area dataset from Rossi MA et al 2019"
+author: "Evgenii O. Tretiakov"
+date: "`r Sys.Date()`"
+output:
+  workflowr::wflow_html:
+    toc: true
+---
+
+```{r setup, echo=FALSE, include=FALSE}
+docname <- "01-eda-whole_dataset-nc"
+now <- Sys.time()
+# Time chunks during knitting
+knitr::knit_hooks$set(timeit = function(before) {
+  if (before) {
+    print(paste("Start:", Sys.time()))
+    now <<- Sys.time()
+  } else {
+    print(paste("Stop:", Sys.time()))
+    print(Sys.time() - now)
+  }
+})
+
+knitr::opts_chunk$set(
+  autodep        = TRUE,
+  cache          = FALSE,
+  cache.path     = paste0("cache/", docname, "/"),
+  cache.comments = FALSE,
+  cache.lazy     = FALSE,
+  dev            = c("png", "pdf"),
+  echo           = TRUE,
+  error          = FALSE,
+  fig.align      = "center",
+  fig.width      = 14,
+  fig.height     = 12,
+  message        = FALSE,
+  warning        = FALSE,
+  timeit         = TRUE
+)
+Sys.setenv(RETICULATE_PYTHON = "/opt/python/3.8.8/bin/python")
+# Load tidyverse infrastructure packages
+suppressPackageStartupMessages({
+  library(here)
+  library(knitr)
+  library(RColorBrewer)
+  library(viridis)
+  library(tidyverse)
+  library(magrittr)
+  library(stringr)
+  library(skimr)
+  library(future)
+  library(zeallot)
+  library(kableExtra)
+  library(reticulate)
+})
+reticulate::use_condaenv("/opt/python/3.8.8/bin/python")
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(SeuratWrappers)
+  library(SeuratDisk)
+  library(sctransform)
+  library(glmGamPoi)
+  library(clustree)
+  library(patchwork)
+  library(qs)
+  library(Scillus)
+  library(scCustomize)
+  library(Nebulosa)
+  library(mrtree)
+  library(gprofiler2)
+})
+
+# Set paths
+src_dir <- here("code")
+data_dir <- here("data")
+output_dir <- here("output")
+plots_dir <- here(output_dir, "figures")
+tables_dir <- here(output_dir, "tables")
+source(here(src_dir, "genes.R"))
+source(here(src_dir, "functions.R"))
+
+# parallelisation
+n_cores <- 32
+options(future.globals.maxSize = 500000 * 1024^2) # 500Gb
+plan(multisession, workers = n_cores)
+
+# set seed
+reseed <- 42
+set.seed(seed = reseed)
+
+# ggplot2 theme
+theme_set(ggmin::theme_powerpoint())
+
+# Introduction
+
+In this document we are going to read in the **RNA** filtered counts matrix produced by `Alevin fry` and results of *Cell Doublets* call that was done using `Scrublet` then using summary statistics we determine which of those genes affected the most by our filtering procedure visualising results by `scCustomize` package and derive several categories of low quality cells using set of manually adjusted threshold parameters. Next, we use filtered high quality dataset to perform initial annotation using `Seurat`, `leidenalg` and `clustree` packages and deduce stable multi-resolution reconcile clustering tree with `mrtree` that we need to identify major cell groups for further analysis.
+
+## Set QC parameters
+
+For the quality control we going to use set of well-known technical parameters reflecting sources of bias in data such as total mRNA content, percentage of mitochondrial mRNA content, fraction of molecules aligned to ribosomal genes, hemoglobine genes transcripts and overall cell complexity, which is determined as ratio between number of observed genes per molecule in logarithmic scale. As for doublets, we will use default `Scrublet` results.
+
+```{r params}
+bioproject <- "PRJNA540713"
+bioproject <- "PRJNA540713"
+project <- "rossi2019_LHA_dropseq"
+low_cutoff_gene <- 300
+high_cutoff_gene <- NULL
+high_cutoff_gene <- 10000
+low_cutoff_umis <- NULL
+low_cutoff_umis <- -Inf
+high_cutoff_umis <- 45000
+high_cutoff_pc_mt <- 25
+high_cutoff_pc_ribo <- 20
+high_cutoff_pc_hb <- 0.1
+high_cutoff_doublet_score <- 0.33
+high_cutoff_complexity <- 0.8
+
+
+# Combined analysis of scRNA-seq datasets derived from the `r project`
+
+```{r load}
+samples_table <- readr::read_tsv(here("samples.tsv")) %>% arrange(Run)
+samples_table <- readr::read_tsv(here("samples.tsv")) %>% arrange(Run)
+srr_set <- samples_table$Run
+
+srt_list <-
+  srr_set %>%
+  map(~ sceasy::convertFormat(
+    here("scrublet", .x, sprintf("%s_initial_annotation_nc.h5ad", .x)),
+    from = "anndata", to = "seurat",
+    outFile = here("scrublet", .x, sprintf("%s-init_srt.rds", .x))
+  ))
+names(srt_list) <- srr_set
+
+combined_srt <-
+  merge(x = srt_list[[1]], y = srt_list[-1], add.cell.ids = srr_set)
+
+combined_srt@assays$RNA@meta.features <-
+  gconvert(
+    rownames(combined_srt),
+    organism = "mmusculus",
+    target = "MGI",
+    filter_na = FALSE
+  ) %>%
+  select(input_number, input, name) %>%
+  mutate(name = if_else(is.na(name), input, name)) %>%
+  .[!duplicated(.), ]
+
+rownames(combined_srt@assays$RNA@counts) <- combined_srt@assays$RNA@meta.features$name
+rownames(combined_srt@assays$RNA@data) <- combined_srt@assays$RNA@meta.features$name
+combined_srt@meta.data %<>%
+  rownames_to_column(var = "cell_name") %>%
+  select(doublet_score, predicted_doublets, cell_name)
+combined_srt$nCount_RNA <- Seurat:::CalcN(combined_srt)$nCount
+combined_srt$nFeature_RNA <- Seurat:::CalcN(combined_srt)$nFeature
+combined_srt <- subset(combined_srt, subset = nCount_RNA >= low_cutoff_gene)
+combined_srt <- UpdateSeuratObject(combined_srt)
+
+rm(srt_list)
+
+
+Quality Control for different types of features {.tabset}
+-----------------------------------------------
+
+### QC Violin plots
+
+```{r pl-vln-qc, fig.align='center', fig.width=16, fig.asp = 0.618}
+sex_genes <-
+sex_genes <-
+  str_to_title(c(
+    "EHD2", "ESPL1", "JARID1D", "PNPLA4",
+    "RPS4Y1", "XIST", "tsix", "Eif2s3y",
+    "Ddx3y", "Uty", "Kdm5d"
+  )) %>% .[. %in% rownames(combined_srt)]
+stress_genes <-
+  str_to_title(c(
+    "Rpl26", "Gstp1", "Rpl35a", "Erh",
+    "Slc25a5", "Pgk1", "Eno1",
+    "Tubb2a", "Emc4", "Scg5"
+  )) %>% .[. %in% rownames(combined_srt)]
+
+combined_srt <-
+  Store_Palette_Seurat(
+    seurat_object = combined_srt,
+    palette = rev(brewer.pal(n = 11, name = "RdYlGn")),
+    palette_name = "mdat_Colour_Pal"
+  )
+combined_srt <-
+  Store_Palette_Seurat(
+    seurat_object = combined_srt,
+    palette = rev(brewer.pal(n = 11, name = "Spectral")),
+    palette_name = "expr_Colour_Pal"
+  )
+combined_srt <-
+  Store_Palette_Seurat(
+    seurat_object = combined_srt,
+    palette = qc_palette,
+    palette_name = "qc_Colour_Pal"
+  )
+
+
+combined_srt <-
+  Add_Mito_Ribo_Seurat(combined_srt, species = "mouse")
+combined_srt[["percent_hb"]] <-
+  PercentageFeatureSet(combined_srt, pattern = "^Hb[^(p)]")
+combined_srt <-
+  Add_Cell_Complexity_Seurat(combined_srt)
+
+# Visualize QC metrics as a violin plot
+p1 <-
+  QC_Plots_Complexity(
+    combined_srt,
+    high_cutoff = high_cutoff_complexity,
+    color_seed = reseed
+  )
+p2 <-
+  QC_Plots_Genes(
+    combined_srt,
+    low_cutoff = low_cutoff_gene,
+    high_cutoff = high_cutoff_gene,
+    plot_title = "Genes per Cell",
+    color_seed = reseed,
+    ggplot_default_colors = TRUE
+  )
+p3 <-
+  QC_Plots_UMIs(
+    combined_srt,
+    low_cutoff = low_cutoff_umis,
+    high_cutoff = high_cutoff_umis,
+    plot_title = "UMIs per Cell",
+    color_seed = reseed,
+    ggplot_default_colors = TRUE
+  )
+p4 <-
+  QC_Plots_Mito(
+    combined_srt,
+    high_cutoff = high_cutoff_pc_mt,
+    plot_title = "Mito genes % per Cell",
+    color_seed = reseed,
+    ggplot_default_colors = TRUE
+  )
+p5 <-
+  QC_Plots_Feature(
+    combined_srt,
+    feature = "percent_ribo",
+    high_cutoff = high_cutoff_pc_ribo,
+    y_axis_label = "% Ribosomal Genes Counts",
+    plot_title = "Ribo genes % per Cell",
+    color_seed = reseed,
+    ggplot_default_colors = TRUE
+  )
+p6 <-
+  QC_Plots_Feature(
+    combined_srt,
+    feature = "percent_hb",
+    high_cutoff = high_cutoff_pc_hb,
+    y_axis_label = "% Hemoglobin Genes Counts",
+    plot_title = "Hemoglobin genes % per Cell",
+    color_seed = reseed,
+    ggplot_default_colors = TRUE
+  )
+
+wrap_plots(p1, p2, p3, p4, p5, p6, ncol = 3)
+
+### QC Scatter plots
+
+```{r pl-scatter-qc, fig.width=11, fig.asp = 0.8}
+plot1 <-
+plot1 <-
+  QC_Plot_GenevsFeature(
+    seurat_object = combined_srt,
+    feature1 = "percent_mito",
+    low_cutoff_gene = low_cutoff_gene,
+    high_cutoff_gene = high_cutoff_gene,
+    high_cutoff_feature = high_cutoff_pc_mt,
+    color_seed = reseed,
+    ggplot_default_colors = TRUE,
+    pt.size = 4,
+    shuffle_seed = reseed
+  ) &
+    scale_y_log10()
+plot2 <-
+  QC_Plot_UMIvsGene(
+    seurat_object = combined_srt,
+    low_cutoff_gene = low_cutoff_gene,
+    high_cutoff_gene = high_cutoff_gene,
+    low_cutoff_UMI = low_cutoff_umis,
+    high_cutoff_UMI = high_cutoff_umis,
+    color_seed = reseed,
+    ggplot_default_colors = TRUE,
+    pt.size = 4,
+    shuffle_seed = reseed
+  ) &
+    scale_x_log10() & scale_y_log10()
+plot3 <-
+  QC_Plot_GenevsFeature(
+    seurat_object = combined_srt,
+    feature1 = "percent_ribo",
+    low_cutoff_gene = low_cutoff_gene,
+    high_cutoff_gene = high_cutoff_gene,
+    high_cutoff_feature = high_cutoff_pc_ribo,
+    color_seed = reseed,
+    ggplot_default_colors = TRUE,
+    pt.size = 4,
+    shuffle_seed = reseed
+  ) &
+    scale_y_log10()
+plot4 <-
+  FeatureScatter(
+    combined_srt,
+    feature1 = "percent_ribo",
+    feature2 = "percent_mito",
+    shuffle = TRUE,
+    pt.size = 4,
+    seed = reseed
+  )
+(plot1 + plot2) / (plot3 + plot4)
+
+### QC Scatter mito-threshold
+
+```{r pl-scatter-qc-comb-mito, fig.height=7, fig.width=13, fig.align='center'}
+QC_Plot_UMIvsGene(
+QC_Plot_UMIvsGene(
+  seurat_object = combined_srt,
+  meta_gradient_name = "percent_mito",
+  low_cutoff_gene = low_cutoff_gene,
+  high_cutoff_gene = high_cutoff_gene,
+  low_cutoff_UMI = low_cutoff_umis,
+  high_cutoff_UMI = high_cutoff_umis,
+  meta_gradient_low_cutoff = high_cutoff_pc_mt,
+  meta_gradient_color = combined_srt@misc$mdat_Colour_Pal,
+  combination = TRUE,
+  color_seed = reseed,
+  ggplot_default_colors = TRUE,
+  pt.size = 3,
+  shuffle_seed = reseed
+) &
+  scale_x_log10() & scale_y_log10()
+
+### QC Scatter ribo-threshold
+
+```{r pl-scatter-qc-comb-ribo, fig.height=7, fig.width=13, fig.align='center'}
+QC_Plot_UMIvsGene(
+QC_Plot_UMIvsGene(
+  seurat_object = combined_srt,
+  meta_gradient_name = "percent_ribo",
+  low_cutoff_gene = low_cutoff_gene,
+  high_cutoff_gene = high_cutoff_gene,
+  low_cutoff_UMI = low_cutoff_umis,
+  high_cutoff_UMI = high_cutoff_umis,
+  meta_gradient_low_cutoff = high_cutoff_pc_ribo,
+  meta_gradient_color = combined_srt@misc$mdat_Colour_Pal,
+  combination = TRUE,
+  color_seed = reseed,
+  ggplot_default_colors = TRUE,
+  pt.size = 3,
+  shuffle_seed = reseed
+) &
+  scale_x_log10() & scale_y_log10()
+
+### QC Scatter complexity-threshold
+
+```{r pl-scatter-qc-comb-complexity, fig.height=7, fig.width=13, fig.align='center'}
+QC_Plot_UMIvsGene(
+QC_Plot_UMIvsGene(
+  seurat_object = combined_srt,
+  meta_gradient_name = "log10GenesPerUMI",
+  low_cutoff_gene = low_cutoff_gene,
+  high_cutoff_gene = high_cutoff_gene,
+  low_cutoff_UMI = low_cutoff_umis,
+  high_cutoff_UMI = high_cutoff_umis,
+  meta_gradient_low_cutoff = high_cutoff_complexity,
+  meta_gradient_color = combined_srt@misc$mdat_Colour_Pal,
+  combination = TRUE,
+  color_seed = reseed,
+  ggplot_default_colors = TRUE,
+  pt.size = 3,
+  shuffle_seed = reseed
+) &
+  scale_x_log10() & scale_y_log10()
+
+### QC Scatter doublets by sample
+
+```{r pl-scatter-doublets-log-prob, echo=FALSE, fig.height=12, fig.width=16, fig.align='center'}
+combined_srt@meta.data %<>%
+combined_srt@meta.data %<>%
+  mutate(QC = ifelse(
+    test = predicted_doublets | doublet_score >= 0.95,
+    yes = "Doublet",
+    no = "Pass"
+  ))
+rownames(combined_srt@meta.data) <- colnames(combined_srt)
+
+Split_FeatureScatter(
+  seurat_object = combined_srt,
+  feature1 = "nFeature_RNA",
+  feature2 = "doublet_score",
+  colors_use = combined_srt@misc$qc_Colour_Pal,
+  split.by = "orig.ident",
+  group.by = "QC",
+  num_columns = if_else(
+    length(unique(combined_srt$orig.ident)) >= 3,
+    3,
+    length(unique(combined_srt$orig.ident))
+  ),
+  shuffle = TRUE,
+  pt.size = 4,
+  seed = reseed
+) &
+  scale_x_log10() &
+  guides(colour = ggh4x::guide_stringlegend(face = "bold", spacing = 15))
+
+### QC Scatter doublets-threshold
+
+```{r pl-scatter-qc-comb-doublets, fig.height=7, fig.width=13, fig.align='center'}
+QC_Plot_UMIvsGene(
+QC_Plot_UMIvsGene(
+  seurat_object = combined_srt,
+  meta_gradient_name = "doublet_score",
+  low_cutoff_gene = low_cutoff_gene,
+  high_cutoff_gene = high_cutoff_gene,
+  low_cutoff_UMI = low_cutoff_umis,
+  high_cutoff_UMI = high_cutoff_umis,
+  meta_gradient_low_cutoff = high_cutoff_doublet_score,
+  meta_gradient_color = combined_srt@misc$mdat_Colour_Pal,
+  combination = TRUE,
+  color_seed = reseed,
+  ggplot_default_colors = TRUE,
+  pt.size = 3,
+  shuffle_seed = reseed
+) &
+  scale_x_log10() & scale_y_log10()
+
+
+Apply QC thresholds to derive categories
+========================================
+
+```{r}
+combined_srt$QC <-
+combined_srt$QC <-
+  ifelse(
+    combined_srt@meta.data$log10GenesPerUMI < high_cutoff_complexity &
+      combined_srt@meta.data$QC == "Pass",
+    "Low_Complexity",
+    combined_srt@meta.data$QC
+  )
+combined_srt$QC <-
+  ifelse(
+    combined_srt@meta.data$log10GenesPerUMI < high_cutoff_complexity &
+      combined_srt@meta.data$QC != "Pass" &
+      combined_srt@meta.data$QC != "Low_Complexity",
+    paste("Low_Complexity", combined_srt@meta.data$QC, sep = ","),
+    combined_srt@meta.data$QC
+  )
+combined_srt$QC <-
+  ifelse(
+    combined_srt@meta.data$nFeature_RNA < low_cutoff_gene &
+      combined_srt@meta.data$QC == "Pass",
+    "Low_nFeature",
+    combined_srt@meta.data$QC
+  )
+combined_srt$QC <-
+  ifelse(
+    combined_srt@meta.data$nFeature_RNA < low_cutoff_gene &
+      combined_srt@meta.data$QC != "Pass" &
+      combined_srt@meta.data$QC != "Low_nFeature",
+    paste("Low_nFeature", combined_srt@meta.data$QC, sep = ","),
+    combined_srt@meta.data$QC
+  )
+combined_srt$QC <-
+  ifelse(
+    combined_srt@meta.data$percent_mito > high_cutoff_pc_mt &
+      combined_srt@meta.data$QC == "Pass",
+    "High_MT",
+    combined_srt@meta.data$QC
+  )
+combined_srt$QC <-
+  ifelse(
+    combined_srt@meta.data$percent_mito > high_cutoff_pc_mt &
+      combined_srt@meta.data$QC != "Pass" &
+      combined_srt@meta.data$QC != "High_MT",
+    paste("High_MT", combined_srt@meta.data$QC, sep = ","),
+    combined_srt@meta.data$QC
+  )
+combined_srt$QC <-
+  ifelse(
+    combined_srt@meta.data$nCount_RNA > high_cutoff_umis &
+      combined_srt@meta.data$QC == "Pass",
+    "High_UMIs",
+    combined_srt@meta.data$QC
+  )
+combined_srt$QC <-
+  ifelse(
+    combined_srt@meta.data$nCount_RNA > high_cutoff_umis &
+      combined_srt@meta.data$QC != "Pass" &
+      combined_srt@meta.data$QC != "High_UMIs",
+    paste("High_UMIs", combined_srt@meta.data$QC, sep = ","),
+    combined_srt@meta.data$QC
+  )
+combined_srt$QC <-
+  ifelse(
+    combined_srt@meta.data$percent_ribo > high_cutoff_pc_ribo &
+      combined_srt@meta.data$QC == "Pass",
+    "High_Ribo",
+    combined_srt@meta.data$QC
+  )
+combined_srt$QC <-
+  ifelse(
+    combined_srt@meta.data$percent_ribo > high_cutoff_pc_ribo &
+      combined_srt@meta.data$QC != "Pass" &
+      combined_srt@meta.data$QC != "High_Ribo",
+    paste("High_Ribo", combined_srt@meta.data$QC, sep = ","),
+    combined_srt@meta.data$QC
+  )
+combined_srt$QC <-
+  ifelse(
+    combined_srt@meta.data$percent_hb > high_cutoff_pc_hb &
+      combined_srt@meta.data$QC == "Pass",
+    "High_Hgb",
+    combined_srt@meta.data$QC
+  )
+combined_srt$QC <-
+  ifelse(
+    combined_srt@meta.data$percent_hb > high_cutoff_pc_hb &
+      combined_srt@meta.data$QC != "Pass" &
+      combined_srt@meta.data$QC != "High_Hgb",
+    paste("High_Hgb", combined_srt@meta.data$QC, sep = ","),
+    combined_srt@meta.data$QC
+  )
+table(combined_srt$QC)
+
+
+Let's see how Scrublet score match distributed across our categories
+
+```{r pl-scatter-doublets-log-prob-qc-categories, echo=FALSE, fig.height=14, fig.width=17, fig.align='center'}
+Split_FeatureScatter(
+Split_FeatureScatter(
+  seurat_object = combined_srt,
+  feature1 = "nFeature_RNA",
+  feature2 = "doublet_score",
+  colors_use = combined_srt@misc$qc_Colour_Pal,
+  split.by = "orig.ident",
+  group.by = "QC",
+  num_columns = if_else(
+    length(unique(combined_srt$orig.ident)) >= 3,
+    3,
+    length(unique(combined_srt$orig.ident))
+  ),
+  shuffle = TRUE,
+  pt.size = 3,
+  seed = reseed
+) &
+  scale_x_log10() &
+  guides(colour = ggh4x::guide_stringlegend(face = "bold", spacing = 15))
+
+
+```{r parent-chunk-name, include=FALSE, results = "hide"}
+child1 <- here::here("analysis/child/eda-nc.Rmd")
+child1 <- here::here("analysis/child/eda-nc.Rmd")
+childy <- readr::read_file(child1)
+
+`r paste(knitr::knit_child(text = childy, options = list(cache = FALSE)), collapse = '\n')`
+
+## Session information
+
+```{r session-info, cache = FALSE}
+devtools::session_info()
+devtools::session_info()
